@@ -123,7 +123,7 @@ export function ClassroomView() {
 
   const resetActiveToken = async () => {
     try {
-      const newToken = Math.random().toString(36).substring(2, 10);
+      const newToken = crypto.randomUUID();
       await updateDoc(doc(db, "classrooms", classroomId as string), {
         activeToken: newToken,
       });

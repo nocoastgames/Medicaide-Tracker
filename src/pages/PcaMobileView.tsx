@@ -109,14 +109,15 @@ export function PcaMobileView() {
                 }
                 
                 if (uid) {
-                    try {
-                        await setDoc(doc(db, 'classrooms', classroomId, 'pcaSessions', uid), {
-                            token: token,
-                            createdAt: Date.now()
-                        });
-                    } catch(e) {
-                       // Allowed to fail if we already have it or if permissions are broader now
-                    }
+                    // Must succeed: this is what proves the token is valid and current.
+                    // Firestore rules allow this write (create or refresh) only when
+                    // `token` matches the classroom's current activeToken - if the QR
+                    // code is stale or bogus, this throws and setupSession's catch
+                    // below reports it instead of silently granting access.
+                    await setDoc(doc(db, 'classrooms', classroomId, 'pcaSessions', uid), {
+                        token: token,
+                        createdAt: Date.now()
+                    });
                 }
             }
 

@@ -2,7 +2,7 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // 0. Global Safety Net
     match /{document=**} {
       allow read, write: if false;
@@ -12,12 +12,16 @@ service cloud.firestore {
     function isSignedIn() {
       return request.auth != null;
     }
-    
+
+    function isAnonymous() {
+      return isSignedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
     function isVerifiedEmail() {
       // In testing we might not have email_verified, but in prod we should. Let's just require isSignedIn.
       return isSignedIn();
     }
-    
+
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
@@ -25,18 +29,30 @@ service cloud.firestore {
     function incoming() { return request.resource.data; }
     function existing() { return resource.data; }
 
+    function myRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    // A real (non-anonymous) account that an admin has approved into a known role.
+    // Excludes 'pending' accounts and anonymous QR-code sessions.
+    function isApprovedStaff() {
+      return isSignedIn() && !isAnonymous() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             myRole() in ['admin', 'teacher', 'pca'];
+    }
+
     function isAdmin() {
-      return isSignedIn() && 
-             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+      return isSignedIn() && !isAnonymous() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             myRole() == 'admin';
     }
 
     function isOwnRecord() {
       return isSignedIn() && request.auth.uid == existing().id;
     }
-    
+
     // --- VALIDATION BLUEPRINTS ---
-    
+
     function isValidUser(data) {
       return data.keys().hasAll(['email', 'role', 'createdAt']) &&
              data.email is string && data.email.size() > 0 && data.email.size() <= 255 &&
@@ -81,17 +97,25 @@ service cloud.firestore {
     function ownsClassroom(classroomId) {
       let classroom = get(/databases/$(database)/documents/classrooms/$(classroomId));
       return classroom != null && (
-             request.auth.uid in classroom.data.get('teacherIds', []) || 
+             request.auth.uid in classroom.data.get('teacherIds', []) ||
              classroom.data.get('teacherId', '') == request.auth.uid
       );
     }
 
+    // An anonymous (QR-code) session is only "active" while its stored token still
+    // matches the classroom's *current* activeToken - rotating the token immediately
+    // revokes any session created against the old one.
     function hasActiveSession(classroomId) {
-      return exists(/databases/$(database)/documents/classrooms/$(classroomId)/pcaSessions/$(request.auth.uid));
+      let sessionPath = /databases/$(database)/documents/classrooms/$(classroomId)/pcaSessions/$(request.auth.uid);
+      return isSignedIn() && exists(sessionPath) &&
+             get(sessionPath).data.token == get(/databases/$(database)/documents/classrooms/$(classroomId)).data.get('activeToken', '');
     }
 
-    function isAuthorizedForClassroom(classroomId) {
-       return ownsClassroom(classroomId) || hasActiveSession(classroomId);
+    // Who may read/write service data for a given classroom: approved staff (any
+    // admin/teacher/pca account, matching this app's district-wide staff visibility),
+    // or an anonymous device holding a currently-valid QR session for that classroom.
+    function canAccessClassroomData(classroomId) {
+      return isAdmin() || isApprovedStaff() || hasActiveSession(classroomId);
     }
 
     // --- COLLECTIONS ---
@@ -100,15 +124,15 @@ service cloud.firestore {
       allow get: if isVerifiedEmail() && (request.auth.uid == userId || isAdmin());
       // Admin list all teachers
       allow list: if isVerifiedEmail() && isAdmin();
-      
+
       allow create: if isVerifiedEmail() && isValidId(userId) && isValidUser(incoming()) && (
-        isAdmin() || 
+        isAdmin() ||
         (request.auth.uid == userId && (
-          incoming().role == 'pending' || 
+          incoming().role == 'pending' ||
           (incoming().role == 'admin' && (request.auth.token.email == 'renegml@nv.ccsd.net' || request.auth.token.email == 'mrenegar@gmail.com'))
         ))
       );
-      
+
       allow update: if isVerifiedEmail() && isValidId(userId) && isValidUser(incoming()) && (
         isAdmin() || (
           request.auth.uid == userId && (
@@ -121,13 +145,18 @@ service cloud.firestore {
     }
 
     match /classrooms/{classroomId} {
-      allow get, list: if isVerifiedEmail();
-      
+      // Single-doc reads (e.g. a QR-code session loading its own classroom) may be
+      // authorized by an active session on that specific classroom.
+      allow get: if isVerifiedEmail() && (isAdmin() || isApprovedStaff() || hasActiveSession(classroomId));
+      // Listing the whole collection can only be validated for staff - an anonymous
+      // session is scoped to a single classroom and must use get(), not list().
+      allow list: if isVerifiedEmail() && (isAdmin() || isApprovedStaff());
+
       allow create: if isVerifiedEmail() && isValidId(classroomId) && isValidClassroom(incoming()) && isAdmin();
-      
+
       allow update: if isVerifiedEmail() && isValidId(classroomId) && (
-        ( (request.auth.uid in existing().get('teacherIds', []) || existing().get('teacherId', '') == request.auth.uid) && 
-          (request.auth.uid in incoming().get('teacherIds', []) || incoming().get('teacherId', '') == request.auth.uid) && 
+        ( (request.auth.uid in existing().get('teacherIds', []) || existing().get('teacherId', '') == request.auth.uid) &&
+          (request.auth.uid in incoming().get('teacherIds', []) || incoming().get('teacherId', '') == request.auth.uid) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'activeToken']) ) ||
         isAdmin()
       );
@@ -135,39 +164,51 @@ service cloud.firestore {
     }
 
     match /classrooms/{classroomId}/pcaSessions/{uid} {
-      allow get, list: if isVerifiedEmail();
-      allow create: if isVerifiedEmail() && uid == request.auth.uid && incoming().token == get(/databases/$(database)/documents/classrooms/$(classroomId)).data.activeToken;
+      allow get: if isVerifiedEmail() && (uid == request.auth.uid || isAdmin() || isApprovedStaff());
+      allow list: if isVerifiedEmail() && (isAdmin() || isApprovedStaff());
+      allow create: if isVerifiedEmail() && uid == request.auth.uid &&
+                    incoming().token == get(/databases/$(database)/documents/classrooms/$(classroomId)).data.activeToken;
+      // Allow a returning session (same device reloading the page) to refresh itself,
+      // as long as it still presents the classroom's current token.
+      allow update: if isVerifiedEmail() && uid == request.auth.uid &&
+                    incoming().token == get(/databases/$(database)/documents/classrooms/$(classroomId)).data.activeToken;
     }
 
     match /pcas/{pcaId} {
-      allow get, list: if isVerifiedEmail();
+      allow get, list: if isVerifiedEmail() && canAccessClassroomData(resource.data.classroomId);
       allow create: if isVerifiedEmail() && isValidId(pcaId) && isValidPCA(incoming()) && (ownsClassroom(incoming().classroomId) || isAdmin());
-      allow update: if isVerifiedEmail() && isValidId(pcaId) && isValidPCA(incoming()) && 
-                    (ownsClassroom(existing().classroomId) || isAdmin()) && 
+      allow update: if isVerifiedEmail() && isValidId(pcaId) && isValidPCA(incoming()) &&
+                    (ownsClassroom(existing().classroomId) || isAdmin()) &&
                     incoming().classroomId == existing().classroomId &&
                     incoming().diff(existing()).affectedKeys().hasOnly(['name']);
       allow delete: if isVerifiedEmail() && isValidId(pcaId) && (ownsClassroom(existing().classroomId) || isAdmin());
     }
 
     match /students/{studentId} {
-      allow get, list: if isVerifiedEmail();
+      allow get, list: if isVerifiedEmail() && canAccessClassroomData(resource.data.classroomId);
       allow create: if isVerifiedEmail() && isValidId(studentId) && isValidStudent(incoming()) && (ownsClassroom(incoming().classroomId) || isAdmin());
-      allow update: if isVerifiedEmail() && isValidId(studentId) && isValidStudent(incoming()) && 
-                    (ownsClassroom(existing().classroomId) || isAdmin()) && 
+      allow update: if isVerifiedEmail() && isValidId(studentId) && isValidStudent(incoming()) &&
+                    (ownsClassroom(existing().classroomId) || isAdmin()) &&
                     incoming().classroomId == existing().classroomId &&
                     incoming().diff(existing()).affectedKeys().hasOnly(['name']);
       allow delete: if isVerifiedEmail() && isValidId(studentId) && (ownsClassroom(existing().classroomId) || isAdmin());
     }
 
     match /serviceLogs/{logId} {
-      allow get, list: if isVerifiedEmail();
-      
-      allow create: if isVerifiedEmail() && isValidId(logId) && isValidServiceLog(incoming());
-      
-      allow update: if isVerifiedEmail() && isValidId(logId) && isValidServiceLog(incoming()) && 
+      allow get, list: if isVerifiedEmail() && canAccessClassroomData(resource.data.classroomId);
+
+      allow create: if isVerifiedEmail() && isValidId(logId) && isValidServiceLog(incoming()) &&
+                    canAccessClassroomData(incoming().classroomId) &&
+                    // The referenced PCA and student must actually belong to the classroom
+                    // being logged against - prevents cross-classroom log injection.
+                    get(/databases/$(database)/documents/pcas/$(incoming().pcaId)).data.classroomId == incoming().classroomId &&
+                    get(/databases/$(database)/documents/students/$(incoming().studentId)).data.classroomId == incoming().classroomId;
+
+      allow update: if isVerifiedEmail() && isValidId(logId) && isValidServiceLog(incoming()) &&
                     incoming().classroomId == existing().classroomId &&
-                    incoming().diff(existing()).affectedKeys().hasOnly(['endTime', 'updatedAt']);
-                    
+                    incoming().diff(existing()).affectedKeys().hasOnly(['endTime', 'updatedAt']) &&
+                    canAccessClassroomData(existing().classroomId);
+
       allow delete: if isVerifiedEmail() && isValidId(logId) && (ownsClassroom(existing().classroomId) || isAdmin());
     }
 
