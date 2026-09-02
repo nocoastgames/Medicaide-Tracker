@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { collection, query, getDocs } from 'firebase/firestore';
-import { db, logout } from '../services/firebase';
-import { handleFirestoreError } from '../lib/firestore-errors';
+import { pb, logout } from '../services/pocketbase';
+import { handlePocketbaseError } from '../lib/pocketbase-errors';
 import { useAuth } from '../contexts/AuthContext';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -20,27 +19,25 @@ export function TeacherDashboard() {
     const loadClassrooms = async () => {
         if (!user) return;
         try {
-            const q = query(collection(db, 'classrooms'));
-            const snap = await getDocs(q);
-            const rooms = snap.docs.map(d => ({ id: d.id, ...d.data() } as any));
+            const rooms = await pb.collection('classrooms').getFullList();
 
-            const sortedRooms = rooms.sort((a, b) => {
-                const aIsMy = a.teacherIds?.includes(user.uid) || a.teacherId === user.uid;
-                const bIsMy = b.teacherIds?.includes(user.uid) || b.teacherId === user.uid;
+            const sortedRooms = rooms.sort((a: any, b: any) => {
+                const aIsMy = a.teacherIds?.includes(user.id);
+                const bIsMy = b.teacherIds?.includes(user.id);
                 if (aIsMy && !bIsMy) return -1;
                 if (!aIsMy && bIsMy) return 1;
                 return a.name.localeCompare(b.name);
             });
 
             setClassrooms(sortedRooms);
-            
+
             // Auto-navigate if not explicitly coming to change room and they have at least one of their own classrooms
-            const myRooms = sortedRooms.filter(c => c.teacherIds?.includes(user.uid) || c.teacherId === user.uid);
+            const myRooms = sortedRooms.filter((c: any) => c.teacherIds?.includes(user.id));
             if (myRooms.length > 0 && !(location.state as any)?.explicit) {
                 navigate(`/classroom/${myRooms[0].id}`, { replace: true });
             }
         } catch (e) {
-            handleFirestoreError(e, 'list', 'classrooms', user);
+            handlePocketbaseError(e, 'list', 'classrooms', user);
         }
     };
 
@@ -75,7 +72,7 @@ export function TeacherDashboard() {
                     </CardHeader>
                     <CardContent className="space-y-4">
                         {classrooms.map(c => {
-                            const isMyRoom = c.teacherIds?.includes(user!.uid) || c.teacherId === user!.uid;
+                            const isMyRoom = c.teacherIds?.includes(user!.id);
                             return (
                                 <div key={c.id} className={`flex items-center justify-between p-4 border rounded shadow-sm ${isMyRoom ? 'border-blue-300 bg-blue-50/30 ring-1 ring-blue-100' : 'hover:border-slate-300'}`}>
                                     <div className="flex flex-col">

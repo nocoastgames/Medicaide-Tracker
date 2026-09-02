@@ -6,21 +6,9 @@ import {
   TabsList,
   TabsTrigger,
 } from "../components/ui/tabs";
-import { db } from "../services/firebase";
-import {
-  collection,
-  query,
-  where,
-  getDocs,
-  setDoc,
-  doc,
-  deleteDoc,
-  updateDoc,
-  getDoc,
-  onSnapshot
-} from "firebase/firestore";
+import { pb } from "../services/pocketbase";
 import { useAuth } from "../contexts/AuthContext";
-import { handleFirestoreError } from "../lib/firestore-errors";
+import { handlePocketbaseError } from "../lib/pocketbase-errors";
 import {
   Card,
   CardHeader,
@@ -83,112 +71,97 @@ export function ClassroomView() {
     loadClassroom();
     loadPcas();
     loadStudents();
-    
-    // Instead of simple getDocs, let's use onSnapshot for strictly real-time service logs
-    const q = query(
-      collection(db, "serviceLogs"),
-      where("classroomId", "==", classroomId)
-    );
-    
-    const unsubscribe = onSnapshot(q, (snap) => {
-      setAllLogs(
-        snap.docs
-          .map((d) => ({ id: d.id, ...d.data() }) as any)
-          .sort((a: any, b: any) => b.startTime - a.startTime)
-      );
-    }, (e) => {
-      console.error("Error heavily fetching logs", e);
-    });
+    loadAllLogs();
 
-    return () => unsubscribe();
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+    pb.collection("serviceLogs")
+      .subscribe("*", (e) => {
+        setAllLogs((prev) => {
+          const withoutRecord = prev.filter((l) => l.id !== e.record.id);
+          const next = e.action === "delete" ? withoutRecord : [...withoutRecord, e.record];
+          return next.sort((a: any, b: any) => b.startTime - a.startTime);
+        });
+      }, { filter: `classroom = "${classroomId}"` })
+      .then((unsub) => { if (cancelled) unsub(); else unsubscribe = unsub; })
+      .catch((e) => console.error("Error subscribing to logs", e));
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
   }, [user, classroomId]);
 
   const loadClassroom = async () => {
     try {
-      const docRef = doc(db, "classrooms", classroomId as string);
-      const snap = await getDoc(docRef);
-      if (snap.exists()) {
-        const data = snap.data();
-        setClassroomName(data.name);
-        if (!data.activeToken) {
-          await resetActiveToken();
-        } else {
-          setActiveToken(data.activeToken);
-        }
+      const classroom = await pb.collection("classrooms").getOne(classroomId as string);
+      setClassroomName(classroom.name);
+      if (!classroom.activeToken) {
+        await resetActiveToken();
+      } else {
+        setActiveToken(classroom.activeToken);
       }
     } catch (e) {
-      handleFirestoreError(e, "get", `classrooms/${classroomId}`, user);
+      handlePocketbaseError(e, "get", `classrooms/${classroomId}`, user);
     }
   };
 
   const resetActiveToken = async () => {
     try {
       const newToken = crypto.randomUUID();
-      await updateDoc(doc(db, "classrooms", classroomId as string), {
+      await pb.collection("classrooms").update(classroomId as string, {
         activeToken: newToken,
       });
       setActiveToken(newToken);
     } catch (e) {
-      handleFirestoreError(e, "update", `classrooms/${classroomId}`, user);
+      handlePocketbaseError(e, "update", `classrooms/${classroomId}`, user);
     }
   };
 
   const loadPcas = async () => {
     try {
-      const q = query(
-        collection(db, "pcas"),
-        where("classroomId", "==", classroomId),
-      );
-      const snap = await getDocs(q);
-      setPcas(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      const list = await pb.collection("pcas").getFullList({
+        filter: `classroom = "${classroomId}"`,
+      });
+      setPcas(list);
     } catch (e) {
-      handleFirestoreError(e, "list", "pcas", user);
+      handlePocketbaseError(e, "list", "pcas", user);
     }
   };
 
   const loadStudents = async () => {
     try {
-      const q = query(
-        collection(db, "students"),
-        where("classroomId", "==", classroomId),
-      );
-      const snap = await getDocs(q);
-      setStudents(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      const list = await pb.collection("students").getFullList({
+        filter: `classroom = "${classroomId}"`,
+      });
+      setStudents(list);
     } catch (e) {
-      handleFirestoreError(e, "list", "students", user);
+      handlePocketbaseError(e, "list", "students", user);
     }
   };
 
   const loadAllLogs = async () => {
     try {
-      const q = query(
-        collection(db, "serviceLogs"),
-        where("classroomId", "==", classroomId),
-      );
-      const snap = await getDocs(q);
-      setAllLogs(
-        snap.docs
-          .map((d) => ({ id: d.id, ...d.data() }) as any)
-          .sort((a: any, b: any) => b.startTime - a.startTime),
-      );
+      const list = await pb.collection("serviceLogs").getFullList({
+        filter: `classroom = "${classroomId}"`,
+      });
+      setAllLogs(list.sort((a: any, b: any) => b.startTime - a.startTime));
     } catch (e) {
-      handleFirestoreError(e, "list", "serviceLogs", user);
+      handlePocketbaseError(e, "list", "serviceLogs", user);
     }
   };
 
   const handleAddItem = async (collectionName: "pcas" | "students") => {
     if (!newItemName.trim() || !user || !classroomId) return;
-    const id = crypto.randomUUID();
     try {
-      await setDoc(doc(db, collectionName, id), {
-        classroomId,
+      await pb.collection(collectionName).create({
+        classroom: classroomId,
         name: newItemName.trim(),
-        createdAt: Date.now(),
       });
       setNewItemName("");
       collectionName === "pcas" ? loadPcas() : loadStudents();
     } catch (e) {
-      handleFirestoreError(e, "create", collectionName, user);
+      handlePocketbaseError(e, "create", collectionName, user);
     }
   };
 
@@ -198,10 +171,10 @@ export function ClassroomView() {
   ) => {
     if (!user) return;
     try {
-      await deleteDoc(doc(db, collectionName, id));
+      await pb.collection(collectionName).delete(id);
       collectionName === "pcas" ? loadPcas() : loadStudents();
     } catch (e) {
-      handleFirestoreError(e, "delete", `${collectionName}/${id}`, user);
+      handlePocketbaseError(e, "delete", `${collectionName}/${id}`, user);
     }
   };
 
@@ -484,37 +457,48 @@ function TrackerApp({
 
   useEffect(() => {
     if (!classroomId) return;
-    
+
     const today = format(new Date(), "yyyy-MM-dd");
-    const q = query(
-      collection(db, "serviceLogs"),
-      where("classroomId", "==", classroomId),
-      where("date", "==", today)
-    );
 
-    const unsubscribe = onSnapshot(q, (snap) => {
-      const logs = snap.docs
-        .map((d) => ({ id: d.id, ...d.data() }) as any)
-        .filter((l: any) => !l.endTime);
-      setActiveLogs(logs);
-    }, (e) => {
-      console.error("Error heavily fetching active logs", e);
-    });
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
 
-    return () => unsubscribe();
+    const load = async () => {
+      const logs = await pb.collection("serviceLogs").getFullList({
+        filter: `classroom = "${classroomId}" && date = "${today}"`,
+      });
+      if (!cancelled) setActiveLogs(logs.filter((l: any) => !l.endTime));
+    };
+    load().catch((e) => console.error("Error heavily fetching active logs", e));
+
+    pb.collection("serviceLogs")
+      .subscribe("*", (e) => {
+        if (e.record.date !== today) return;
+        setActiveLogs((prev) => {
+          const withoutRecord = prev.filter((l) => l.id !== e.record.id);
+          if (e.action === "delete" || e.record.endTime) return withoutRecord;
+          return [...withoutRecord, e.record];
+        });
+      }, { filter: `classroom = "${classroomId}"` })
+      .then((unsub) => { if (cancelled) unsub(); else unsubscribe = unsub; })
+      .catch((e) => console.error("Error subscribing to active logs", e));
+
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
   }, [classroomId]);
 
   const startService = async (serviceType: string) => {
     if (!selectedPca || !selectedStudent || !classroomId || !user) return;
-    const id = crypto.randomUUID();
     const now = Date.now();
     const todayStr = format(now, "yyyy-MM-dd");
 
     try {
-      await setDoc(doc(db, "serviceLogs", id), {
-        classroomId,
-        studentId: selectedStudent.id,
-        pcaId: selectedPca.id,
+      await pb.collection("serviceLogs").create({
+        classroom: classroomId,
+        student: selectedStudent.id,
+        pca: selectedPca.id,
         serviceType,
         startTime: now,
         date: todayStr,
@@ -525,19 +509,19 @@ function TrackerApp({
       setSelectedPca(null);
       setSelectedStudent(null);
     } catch (e) {
-      handleFirestoreError(e, "create", "serviceLogs", user);
+      handlePocketbaseError(e, "create", "serviceLogs", user);
     }
   };
 
   const endService = async (logId: string) => {
     if (!user) return;
     try {
-      await updateDoc(doc(db, "serviceLogs", logId), {
+      await pb.collection("serviceLogs").update(logId, {
         endTime: Date.now(),
         updatedAt: Date.now(),
       });
     } catch (e) {
-      handleFirestoreError(e, "update", `serviceLogs/${logId}`, user);
+      handlePocketbaseError(e, "update", `serviceLogs/${logId}`, user);
     }
   };
 
@@ -700,11 +684,11 @@ function TrackerApp({
           </h2>
           <div className="space-y-4 overflow-y-auto pr-2 flex-grow">
             {activeLogs.map((log) => {
-              const pcaName = getPcaName(log.pcaId);
-              const studentName = getStudentName(log.studentId);
+              const pcaName = getPcaName(log.pca);
+              const studentName = getStudentName(log.student);
               const elapsedMins = Math.floor((now - log.startTime) / 60000);
               const isOvertime = elapsedMins > 120;
-              
+
               return (
                 <div
                   key={log.id}
@@ -785,37 +769,32 @@ function ServiceLogsManager({
     if (!studentId || !pcaId || !date || !startTime || !endTime) return;
 
     try {
-      const id = crypto.randomUUID();
       // Parse start and end times into milliseconds
       const startD = new Date(`${date}T${startTime}`);
       const endD = new Date(`${date}T${endTime}`);
 
-      const docData = {
-        id,
-        classroomId,
-        studentId,
-        pcaId,
+      await pb.collection("serviceLogs").create({
+        classroom: classroomId,
+        student: studentId,
+        pca: pcaId,
         serviceType,
         date,
         startTime: startD.getTime(),
         endTime: endD.getTime(),
         createdAt: Date.now(),
         updatedAt: Date.now(),
-      };
-
-      await setDoc(doc(db, "serviceLogs", id), docData);
+      });
     } catch (e) {
-      handleFirestoreError(e, "create", "serviceLogs", user);
+      handlePocketbaseError(e, "create", "serviceLogs", user);
     }
   };
 
   const deleteLog = async (id: string) => {
     try {
-      await deleteDoc(doc(db, "serviceLogs", id));
-      // In a real app we'd trigger a reload of logs, but onSnapshot already does it for us
-      // or we just let onSnapshot handle it if this component isn't using onSnapshot for all logs. Wait, allLogs is managed by onSnapshot in the parent, so it's auto-updating!
+      await pb.collection("serviceLogs").delete(id);
+      // The realtime subscription in the parent will pick up the delete event.
     } catch (e) {
-      handleFirestoreError(e, "delete", `serviceLogs/${id}`, user);
+      handlePocketbaseError(e, "delete", `serviceLogs/${id}`, user);
     }
   };
 
@@ -825,10 +804,10 @@ function ServiceLogsManager({
       const startD = new Date(`${editingLog.editDate}T${editingLog.editStartTime}`);
       const endD = editingLog.editEndTime ? new Date(`${editingLog.editDate}T${editingLog.editEndTime}`) : null;
 
-      await updateDoc(doc(db, "serviceLogs", editingLog.id), {
+      await pb.collection("serviceLogs").update(editingLog.id, {
         date: editingLog.editDate,
-        studentId: editingLog.studentId,
-        pcaId: editingLog.pcaId,
+        student: editingLog.student,
+        pca: editingLog.pca,
         serviceType: editingLog.serviceType,
         startTime: startD.getTime(),
         ...(endD ? { endTime: endD.getTime() } : {}),
@@ -836,7 +815,7 @@ function ServiceLogsManager({
       });
       setEditingLog(null);
     } catch (e) {
-      handleFirestoreError(e, "update", `serviceLogs/${editingLog.id}`, user);
+      handlePocketbaseError(e, "update", `serviceLogs/${editingLog.id}`, user);
     }
   };
 
@@ -950,7 +929,7 @@ function ServiceLogsManager({
           </div>
         </CardContent>
       </Card>
-      
+
       {editingLog && (
         <Card className="border-amber-400 bg-amber-50">
           <CardHeader>
@@ -964,13 +943,13 @@ function ServiceLogsManager({
               </div>
               <div className="space-y-2">
                 <label className="text-xs font-bold text-amber-700 uppercase">Student</label>
-                <select className="w-full h-10 px-3 border rounded-md" value={editingLog.studentId} onChange={(e) => setEditingLog({ ...editingLog, studentId: e.target.value })}>
+                <select className="w-full h-10 px-3 border rounded-md" value={editingLog.student} onChange={(e) => setEditingLog({ ...editingLog, student: e.target.value })}>
                   {students.map((s: any) => <option key={s.id} value={s.id}>{s.name}</option>)}
                 </select>
               </div>
               <div className="space-y-2">
                 <label className="text-xs font-bold text-amber-700 uppercase">PCA</label>
-                <select className="w-full h-10 px-3 border rounded-md" value={editingLog.pcaId} onChange={(e) => setEditingLog({ ...editingLog, pcaId: e.target.value })}>
+                <select className="w-full h-10 px-3 border rounded-md" value={editingLog.pca} onChange={(e) => setEditingLog({ ...editingLog, pca: e.target.value })}>
                   {pcas.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
               </div>
@@ -1019,9 +998,9 @@ function ServiceLogsManager({
                 <TableRow key={log.id} className={editingLog?.id === log.id ? "bg-amber-50" : ""}>
                   <TableCell>{log.date}</TableCell>
                   <TableCell className="font-medium">
-                    {getStudentName(log.studentId)}
+                    {getStudentName(log.student)}
                   </TableCell>
-                  <TableCell>{getPcaName(log.pcaId)}</TableCell>
+                  <TableCell>{getPcaName(log.pca)}</TableCell>
                   <TableCell>{log.serviceType}</TableCell>
                   <TableCell>{format(log.startTime, "h:mm a")}</TableCell>
                   <TableCell>
@@ -1103,10 +1082,10 @@ function ExportManager({
         (l) => l.date >= exportStartDate && l.date <= exportEndDate,
       );
       if (filterPca !== "ALL")
-        filteredLogs = filteredLogs.filter((l) => l.pcaId === filterPca);
+        filteredLogs = filteredLogs.filter((l) => l.pca === filterPca);
       if (filterStudent !== "ALL")
         filteredLogs = filteredLogs.filter(
-          (l) => l.studentId === filterStudent,
+          (l) => l.student === filterStudent,
         );
 
       if (filteredLogs.length === 0) {
@@ -1118,7 +1097,7 @@ function ExportManager({
       // Group logs
       const map = new Map<string, any[]>();
       filteredLogs.forEach((l) => {
-        const minKey = `${l.date}_${l.studentId}_${l.pcaId}`;
+        const minKey = `${l.date}_${l.student}_${l.pca}`;
         if (!map.has(minKey)) map.set(minKey, []);
         map.get(minKey)!.push(l);
       });

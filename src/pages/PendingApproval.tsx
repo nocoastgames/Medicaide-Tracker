@@ -1,4 +1,4 @@
-import { logout } from '../services/firebase';
+import { logout } from '../services/pocketbase';
 
 export function PendingApproval() {
     return (

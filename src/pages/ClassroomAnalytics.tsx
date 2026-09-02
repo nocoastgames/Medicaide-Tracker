@@ -26,8 +26,8 @@ export function ClassroomAnalytics({
             if (duration < 0 || duration > 1440) return; // ignore invalid or > 24hr
 
             totalMinutes += duration;
-            studentMins[log.studentId] = (studentMins[log.studentId] || 0) + duration;
-            pcaMins[log.pcaId] = (pcaMins[log.pcaId] || 0) + duration;
+            studentMins[log.student] = (studentMins[log.student] || 0) + duration;
+            pcaMins[log.pca] = (pcaMins[log.pca] || 0) + duration;
             serviceMins[log.serviceType] = (serviceMins[log.serviceType] || 0) + duration;
         });
 

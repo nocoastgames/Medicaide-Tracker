@@ -1,15 +1,21 @@
-import { loginWithGoogle } from '../services/firebase';
+import { loginWithPassword, registerAccount } from '../services/pocketbase';
 import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '../components/ui/card';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 
 export function Login() {
     const { user, role, loading } = useAuth();
     const navigate = useNavigate();
-    const [isLoggingIn, setIsLoggingIn] = useState(false);
+    const [mode, setMode] = useState<'signin' | 'signup'>('signin');
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+    const [name, setName] = useState("");
+    const [isSubmitting, setIsSubmitting] = useState(false);
     const [errorMsg, setErrorMsg] = useState("");
 
     useEffect(() => {
@@ -18,33 +24,25 @@ export function Login() {
              else if (role === 'teacher') navigate('/teacher');
              else if (role === 'pending') navigate('/pending');
              else if (role === 'pca') navigate('/pca-dashboard');
-             else if (role === null) {
-                 // Do not navigate, stay on login page if role is null (e.g. error fetching role)
-                 // You might want to show the error state in the UI.
-                 if (isLoggingIn) {
-                     setIsLoggingIn(false);
-                 }
-             }
         }
     }, [user, role, loading, navigate]);
 
-    const handleLogin = async () => {
-        if (isLoggingIn) return;
-        setIsLoggingIn(true);
+    const handleSubmit = async (e: FormEvent) => {
+        e.preventDefault();
+        if (isSubmitting) return;
+        setIsSubmitting(true);
         setErrorMsg("");
 
         try {
-            await loginWithGoogle();
-        } catch (e: any) {
-            console.error("Login failed", e);
-            if (e.code === 'auth/popup-blocked') {
-                setErrorMsg("Popup blocked by browser. Please allow popups for this site and try again, or click 'Open App' in the top right to open in a new tab.");
-            } else if (e.code === 'auth/cancelled-popup-request' || e.code === 'auth/popup-closed-by-user') {
-                setErrorMsg("Login popup was closed before finishing.");
+            if (mode === 'signin') {
+                await loginWithPassword(email, password);
             } else {
-                setErrorMsg("An error occurred during login. Please try again. " + (e.message || ""));
+                await registerAccount(email, password, name);
             }
-            setIsLoggingIn(false);
+        } catch (e: any) {
+            console.error(`${mode} failed`, e);
+            setErrorMsg(e?.response?.message || e.message || `An error occurred. Please try again.`);
+            setIsSubmitting(false);
         }
     };
 
@@ -53,7 +51,7 @@ export function Login() {
             <Card className="w-full max-w-md">
                 <CardHeader className="text-center">
                     <CardTitle className="text-2xl font-bold">Medicaid Time Tracker</CardTitle>
-                    <CardDescription>Login to manage or record service times</CardDescription>
+                    <CardDescription>{mode === 'signin' ? 'Login to manage or record service times' : 'Create an account to request access'}</CardDescription>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-4">
                     {errorMsg && (
@@ -61,16 +59,37 @@ export function Login() {
                             {errorMsg}
                         </div>
                     )}
-                    <Button onClick={handleLogin} disabled={isLoggingIn || loading} size="lg" className="w-full">
-                        {isLoggingIn ? (
-                            <>
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                Please wait...
-                            </>
-                        ) : (
-                            "Sign in with Google"
+                    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+                        {mode === 'signup' && (
+                            <div className="space-y-1">
+                                <Label htmlFor="name">Name</Label>
+                                <Input id="name" value={name} onChange={(e) => setName(e.target.value)} required />
+                            </div>
                         )}
-                    </Button>
+                        <div className="space-y-1">
+                            <Label htmlFor="email">Email</Label>
+                            <Input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+                        </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="password">Password</Label>
+                            <Input id="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} />
+                        </div>
+                        <Button type="submit" disabled={isSubmitting || loading} size="lg" className="w-full">
+                            {isSubmitting ? (
+                                <>
+                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                    Please wait...
+                                </>
+                            ) : mode === 'signin' ? "Sign In" : "Create Account"}
+                        </Button>
+                    </form>
+                    <button
+                        type="button"
+                        onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setErrorMsg(""); }}
+                        className="text-sm text-slate-500 hover:text-slate-800"
+                    >
+                        {mode === 'signin' ? "Need an account? Create one" : "Already have an account? Sign in"}
+                    </button>
                 </CardContent>
             </Card>
         </div>

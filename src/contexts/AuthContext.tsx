@@ -1,78 +1,42 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { User, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
-import { auth, db } from '../services/firebase';
+import { RecordModel } from 'pocketbase';
+import { pb, Role } from '../services/pocketbase';
 
 interface AuthContextType {
-  user: User | null;
-  role: 'admin' | 'teacher' | 'pca' | 'pending' | null;
+  user: RecordModel | null;
+  role: Role | null;
   loading: boolean;
 }
 
 const AuthContext = createContext<AuthContextType>({ user: null, role: null, loading: true });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [role, setRole] = useState<'admin' | 'teacher' | 'pca' | 'pending' | null>(null);
+  const [user, setUser] = useState<RecordModel | null>(pb.authStore.record as RecordModel | null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
-      if (currentUser) {
-        if (currentUser.isAnonymous) {
-            setRole('pca');
-            setLoading(false);
-            return;
-        }
+    const unsubscribe = pb.authStore.onChange((_token, record) => {
+      setUser(record as RecordModel | null);
+    }, true);
 
+    (async () => {
+      // The locally cached auth record can be stale (e.g. an admin changed
+      // this user's role since their last login) - refresh it on load.
+      if (pb.authStore.isValid) {
         try {
-            const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
-            const isAdminEmail = currentUser.email === 'renegml@nv.ccsd.net' || currentUser.email === 'mrenegar@gmail.com';
-
-            if (userDoc.exists()) {
-                const data = userDoc.data();
-                if (isAdminEmail && data.role !== 'admin') {
-                    try {
-                        await updateDoc(doc(db, 'users', currentUser.uid), { role: 'admin' });
-                        setRole('admin');
-                    } catch (updateErr) {
-                        console.error("Error setting admin role initially", updateErr);
-                        setRole('pending'); // fallback so they don't get stuck
-                    }
-                } else {
-                    setRole(data.role);
-                }
-            } else {
-                // If it's the requested admin emails, become admin. Otherwise become pending.
-                const initialRole = isAdminEmail ? 'admin' : 'pending';
-                
-                const newUser = {
-                    email: currentUser.email || '',
-                    displayName: currentUser.displayName || '',
-                    role: initialRole,
-                    createdAt: Date.now()
-                };
-                try {
-                    await setDoc(doc(db, 'users', currentUser.uid), newUser);
-                    setRole(initialRole);
-                } catch (setErr) {
-                    console.error("Error creating new user doc", setErr);
-                    setRole('pending'); // fallback
-                }
-            }
+          await pb.collection('users').authRefresh();
         } catch (e) {
-            console.error("Error fetching user role", e);
-            setRole('pending');
+          console.error('Error refreshing auth session', e);
+          pb.authStore.clear();
         }
-      } else {
-        setRole(null);
       }
       setLoading(false);
-    });
+    })();
 
     return unsubscribe;
   }, []);
+
+  const role = (user?.role as Role) ?? null;
 
   return (
     <AuthContext.Provider value={{ user, role, loading }}>

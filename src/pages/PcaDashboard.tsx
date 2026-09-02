@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { collection, query, getDocs } from 'firebase/firestore';
-import { db, logout } from '../services/firebase';
-import { handleFirestoreError } from '../lib/firestore-errors';
+import { pb, logout } from '../services/pocketbase';
+import { handlePocketbaseError } from '../lib/pocketbase-errors';
 import { useAuth } from '../contexts/AuthContext';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -20,9 +19,7 @@ export function PcaDashboard() {
     const loadClassrooms = async () => {
         if (!user) return;
         try {
-            const q = query(collection(db, 'classrooms'));
-            const snap = await getDocs(q);
-            const rooms = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+            const rooms = await pb.collection('classrooms').getFullList();
             setClassrooms(rooms);
 
             if (rooms.length > 0 && !(location.state as any)?.explicit) {
@@ -31,7 +28,7 @@ export function PcaDashboard() {
                 navigate(`/pca/${rooms[0].id}/login-bypass`, { replace: true });
             }
         } catch (e) {
-            handleFirestoreError(e, 'list', 'classrooms', user);
+            handlePocketbaseError(e, 'list', 'classrooms', user);
         }
     };
 

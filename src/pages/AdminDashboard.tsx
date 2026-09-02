@@ -1,9 +1,8 @@
 import { useEffect, useState } from 'react';
-import { collection, query, getDocs, doc, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
-import { db, logout } from '../services/firebase';
+import { pb, logout } from '../services/pocketbase';
 import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/card';
 import { Button } from '../components/ui/button';
-import { handleFirestoreError } from '../lib/firestore-errors';
+import { handlePocketbaseError } from '../lib/pocketbase-errors';
 import { useAuth } from '../contexts/AuthContext';
 import { Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/table';
 import { Link, useNavigate } from 'react-router-dom';
@@ -19,7 +18,7 @@ export function AdminDashboard() {
     const [isCreatingClassroom, setIsCreatingClassroom] = useState(false);
     const { user } = useAuth();
     const navigate = useNavigate();
-    
+
     useEffect(() => {
         loadUsers();
         loadClassrooms();
@@ -27,87 +26,78 @@ export function AdminDashboard() {
 
     const loadUsers = async () => {
         try {
-            const q = query(collection(db, 'users'));
-            const snap = await getDocs(q);
-            setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+            setUsers(await pb.collection('users').getFullList());
         } catch (e) {
-            handleFirestoreError(e, 'list', 'users', user);
+            handlePocketbaseError(e, 'list', 'users', user);
         }
     };
 
     const loadClassrooms = async () => {
         try {
-            const q = query(collection(db, 'classrooms'));
-            const snap = await getDocs(q);
-            setClassrooms(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+            setClassrooms(await pb.collection('classrooms').getFullList());
         } catch (e) {
-            handleFirestoreError(e, 'list', 'classrooms', user);
+            handlePocketbaseError(e, 'list', 'classrooms', user);
         }
     };
 
     const updateRole = async (targetUser: any, newRole: string) => {
         if (!user) return;
         try {
-            await updateDoc(doc(db, 'users', targetUser.id), {
-                role: newRole,
-                updatedAt: Date.now()
-            });
+            await pb.collection('users').update(targetUser.id, { role: newRole });
             loadUsers();
         } catch (e) {
-            handleFirestoreError(e, 'update', `users/${targetUser.id}`, user);
+            handlePocketbaseError(e, 'update', `users/${targetUser.id}`, user);
         }
     };
 
     const deleteUser = async (id: string) => {
         if (!user) return;
         try {
-            await deleteDoc(doc(db, 'users', id));
+            await pb.collection('users').delete(id);
             loadUsers();
         } catch (e) {
-            handleFirestoreError(e, 'delete', `users/${id}`, user);
+            handlePocketbaseError(e, 'delete', `users/${id}`, user);
         }
     };
 
     const confirmDeleteClassroom = async () => {
         if (!user || !deletingClassroom) return;
         try {
-            await deleteDoc(doc(db, 'classrooms', deletingClassroom.id));
+            await pb.collection('classrooms').delete(deletingClassroom.id);
             loadClassrooms();
             setDeletingClassroom(null);
         } catch (e) {
-            handleFirestoreError(e, 'delete', `classrooms/${deletingClassroom.id}`, user);
+            handlePocketbaseError(e, 'delete', `classrooms/${deletingClassroom.id}`, user);
         }
     };
 
     const confirmEditClassroom = async () => {
         if (!user || !editingClassroom) return;
         try {
-            await updateDoc(doc(db, 'classrooms', editingClassroom.id), {
+            await pb.collection('classrooms').update(editingClassroom.id, {
                 name: newClassName.trim() || editingClassroom.name,
                 teacherIds: newClassTeacherIds
             });
             loadClassrooms();
             setEditingClassroom(null);
         } catch (e) {
-            handleFirestoreError(e, 'update', `classrooms/${editingClassroom.id}`, user);
+            handlePocketbaseError(e, 'update', `classrooms/${editingClassroom.id}`, user);
         }
     };
 
     const confirmCreateClassroom = async () => {
         if (!user || !newClassName.trim() || newClassTeacherIds.length === 0) return;
         try {
-            const newRef = doc(collection(db, 'classrooms'));
-            await setDoc(newRef, {
+            await pb.collection('classrooms').create({
                 name: newClassName.trim(),
                 teacherIds: newClassTeacherIds,
-                createdAt: Date.now()
             });
             loadClassrooms();
             setIsCreatingClassroom(false);
             setNewClassName("");
             setNewClassTeacherIds([]);
         } catch (e) {
-            handleFirestoreError(e, 'create', 'classrooms', user);
+            handlePocketbaseError(e, 'create', 'classrooms', user);
         }
     };
 
@@ -151,14 +141,14 @@ export function AdminDashboard() {
                                     <div className="flex justify-between items-start">
                                         <CardTitle>{c.name}</CardTitle>
                                         <div className="flex space-x-2">
-                                            <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); setEditingClassroom(c); setNewClassName(c.name); setNewClassTeacherIds(c.teacherIds || (c.teacherId ? [c.teacherId] : [])); }}>Edit</Button>
+                                            <Button variant="outline" size="sm" onClick={(e) => { e.stopPropagation(); setEditingClassroom(c); setNewClassName(c.name); setNewClassTeacherIds(c.teacherIds || []); }}>Edit</Button>
                                             <Button variant="destructive" size="sm" onClick={(e) => { e.stopPropagation(); setDeletingClassroom(c); }}>Delete</Button>
                                         </div>
                                     </div>
                                 </CardHeader>
                                 <CardContent>
                                     <p className="text-sm text-slate-500">
-                                        Teachers: {(c.teacherIds || (c.teacherId ? [c.teacherId] : [])).map((tId: string) => users.find(u => u.id === tId)?.displayName || users.find(u => u.id === tId)?.email || tId).join(', ') || 'None'}
+                                        Teachers: {(c.teacherIds || []).map((tId: string) => users.find(u => u.id === tId)?.name || users.find(u => u.id === tId)?.email || tId).join(', ') || 'None'}
                                     </p>
                                     <div className="mt-4 pt-4 border-t border-slate-100 flex justify-end">
                                         <Button variant="outline" size="sm">View Resources</Button>
@@ -193,10 +183,10 @@ export function AdminDashboard() {
                                     {users.map(u => (
                                         <TableRow key={u.id}>
                                             <TableCell>{u.email}</TableCell>
-                                            <TableCell>{u.displayName}</TableCell>
+                                            <TableCell>{u.name}</TableCell>
                                             <TableCell>
-                                                <select 
-                                                    value={u.role || 'pending'} 
+                                                <select
+                                                    value={u.role || 'pending'}
                                                     onChange={(e) => updateRole(u, e.target.value)}
                                                     className="px-2 py-1 rounded text-xs font-medium border border-slate-200 bg-slate-50"
                                                 >
@@ -245,8 +235,8 @@ export function AdminDashboard() {
                                 <div className="space-y-2 border border-slate-300 rounded px-3 py-2 max-h-40 overflow-y-auto bg-slate-50">
                                     {users.filter(u => u.role === 'teacher' || u.role === 'admin').map(u => (
                                         <label key={u.id} className="flex items-center space-x-2">
-                                            <input 
-                                                type="checkbox" 
+                                            <input
+                                                type="checkbox"
                                                 checked={newClassTeacherIds.includes(u.id)}
                                                 onChange={(e) => {
                                                     if (e.target.checked) setNewClassTeacherIds([...newClassTeacherIds, u.id]);
@@ -254,7 +244,7 @@ export function AdminDashboard() {
                                                 }}
                                                 className="rounded text-blue-600 focus:ring-blue-500"
                                             />
-                                            <span className="text-sm font-medium text-slate-700">{u.displayName || u.email}</span>
+                                            <span className="text-sm font-medium text-slate-700">{u.name || u.email}</span>
                                         </label>
                                     ))}
                                 </div>
@@ -288,8 +278,8 @@ export function AdminDashboard() {
                                 <div className="space-y-2 border border-slate-300 rounded px-3 py-2 max-h-40 overflow-y-auto bg-slate-50">
                                     {users.filter(u => u.role === 'teacher' || u.role === 'admin').map(u => (
                                         <label key={u.id} className="flex items-center space-x-2">
-                                            <input 
-                                                type="checkbox" 
+                                            <input
+                                                type="checkbox"
                                                 checked={newClassTeacherIds.includes(u.id)}
                                                 onChange={(e) => {
                                                     if (e.target.checked) setNewClassTeacherIds([...newClassTeacherIds, u.id]);
@@ -297,7 +287,7 @@ export function AdminDashboard() {
                                                 }}
                                                 className="rounded text-blue-600 focus:ring-blue-500"
                                             />
-                                            <span className="text-sm font-medium text-slate-700">{u.displayName || u.email}</span>
+                                            <span className="text-sm font-medium text-slate-700">{u.name || u.email}</span>
                                         </label>
                                     ))}
                                 </div>

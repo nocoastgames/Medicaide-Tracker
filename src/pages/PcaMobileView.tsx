@@ -1,12 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { db, auth } from '../services/firebase';
-import { signInAnonymously } from 'firebase/auth';
-import { collection, query, where, getDocs, getDoc, doc, setDoc, updateDoc, onSnapshot } from 'firebase/firestore';
+import { pb, logout } from '../services/pocketbase';
 import { Button } from '../components/ui/button';
 import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/card';
 import { format } from 'date-fns';
-import { Link } from 'react-router-dom';
 
 const SERVICES = [
     "Toileting/Diapering",
@@ -21,8 +18,7 @@ export function PcaMobileView() {
     const navigate = useNavigate();
     const [status, setStatus] = useState<'initializing' | 'invalid' | 'ready'>('initializing');
     const [errorMsg, setErrorMsg] = useState('');
-    const [authWaitMsg, setAuthWaitMsg] = useState('');
-    
+
     const [classroomName, setClassroomName] = useState('Loading...');
     const [pcas, setPcas] = useState<any[]>([]);
     const [students, setStudents] = useState<any[]>([]);
@@ -37,14 +33,21 @@ export function PcaMobileView() {
     const [now, setNow] = useState(Date.now());
     const [isOffline, setIsOffline] = useState(!navigator.onLine);
 
+    // A staff (Google/email) session covers its own access via the `pca` role -
+    // no per-classroom token is needed or sent. Anyone else is a QR-code device:
+    // every request must carry the classroom's current token as a query param,
+    // which is exactly what the `pcas`/`students`/`serviceLogs` API rules check.
+    const isStaffMode = !token || token === 'login-bypass';
+    const authQuery = isStaffMode ? {} : { query: { token } };
+
     useEffect(() => {
         const interval = setInterval(() => setNow(Date.now()), 60000);
-        
+
         const handleOnline = () => setIsOffline(false);
         const handleOffline = () => setIsOffline(true);
         window.addEventListener('online', handleOnline);
         window.addEventListener('offline', handleOffline);
-        
+
         return () => {
             clearInterval(interval);
             window.removeEventListener('online', handleOnline);
@@ -54,7 +57,7 @@ export function PcaMobileView() {
 
     useEffect(() => {
         let wakeLock: any = null;
-        
+
         const requestWakeLock = async () => {
             try {
                 if ('wakeLock' in navigator) {
@@ -94,131 +97,107 @@ export function PcaMobileView() {
     const setupSession = async () => {
         if (!classroomId || !token) return;
         try {
-            if (token === 'login-bypass') {
-                // Already authenticated via Google (PCA Dashboard)
-                if (!auth.currentUser) {
-                    navigate('/login');
-                    return; 
-                }
-            } else {
-                // Anonymous sign in flow (QR Code)
-                let uid = auth.currentUser?.uid;
-                if (!uid) {
-                    const cred = await signInAnonymously(auth);
-                    uid = cred.user.uid;
-                }
-                
-                if (uid) {
-                    // Must succeed: this is what proves the token is valid and current.
-                    // Firestore rules allow this write (create or refresh) only when
-                    // `token` matches the classroom's current activeToken - if the QR
-                    // code is stale or bogus, this throws and setupSession's catch
-                    // below reports it instead of silently granting access.
-                    await setDoc(doc(db, 'classrooms', classroomId, 'pcaSessions', uid), {
-                        token: token,
-                        createdAt: Date.now()
-                    });
-                }
+            if (isStaffMode && !pb.authStore.isValid) {
+                navigate('/login');
+                return;
             }
 
-            // If we succeed writing session or bypassed, we can now read data.
-            await loadClassroom();
-            await loadPcas();
-            await loadStudents();
-            setStatus('ready');
+            // A get() here both loads the classroom name and proves the token is
+            // valid - if it's stale or bogus, the `classrooms` API rule denies it
+            // and this throws, which the catch below reports.
+            const classroom = await pb.collection('classrooms').getOne(classroomId, authQuery as any);
+            setClassroomName(classroom.name);
 
+            const pcasList = await pb.collection('pcas').getFullList({ filter: `classroom = "${classroomId}"`, ...authQuery });
+            setPcas(pcasList);
+            if (pcaId) {
+                const found = pcasList.find(p => p.id === pcaId);
+                if (found) setSelectedPca(found);
+            }
+
+            const studentsList = await pb.collection('students').getFullList({ filter: `classroom = "${classroomId}"`, ...authQuery });
+            setStudents(studentsList);
+
+            setStatus('ready');
         } catch (error: any) {
             console.error('Error setting up PCA session:', error);
-            if (error.code === 'auth/operation-not-allowed') {
-                setErrorMsg('Anonymous authentication is not enabled in this app\'s Firebase project. The developer must go to the Firebase Console -> Authentication -> Sign-in Method -> add Anonymous and enable it.');
-                setAuthWaitMsg('Waiting for developer or teacher to fix...');
-            } else if (error.code === 'permission-denied' || error.message?.includes('permission')) {
-                setErrorMsg('Invalid or expired QR code link ' + error.message);
+            if (error?.status === 404 || error?.status === 403) {
+                setErrorMsg('Invalid or expired QR code link. Please ask the teacher to show you the QR code again.');
             } else {
-                setErrorMsg('Failed to connect to the classroom session. details: ' + (error.message || JSON.stringify(error)));
+                setErrorMsg('Failed to connect to the classroom session. details: ' + (error?.message || JSON.stringify(error)));
             }
             setStatus('invalid');
         }
     };
 
-    const loadClassroom = async () => {
-        if (!classroomId) return;
-        const snap = await getDoc(doc(db, 'classrooms', classroomId));
-        if (snap.exists()) setClassroomName(snap.data().name);
-    };
-
-    const loadPcas = async () => {
-        if (!classroomId) return;
-        const q = query(collection(db, 'pcas'), where('classroomId', '==', classroomId));
-        const snap = await getDocs(q);
-        const pcasList = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        setPcas(pcasList);
-        if (pcaId) {
-             const found = pcasList.find(p => p.id === pcaId);
-             if (found) setSelectedPca(found);
-        }
-    };
-
-    const loadStudents = async () => {
-        if (!classroomId) return;
-        const q = query(collection(db, 'students'), where('classroomId', '==', classroomId));
-        const snap = await getDocs(q);
-        setStudents(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-    };
-
     useEffect(() => {
         if (status !== 'ready' || !classroomId) return;
         const today = format(new Date(), 'yyyy-MM-dd');
-        const q = query(collection(db, 'serviceLogs'), where('classroomId', '==', classroomId), where('date', '==', today));
-        const unsubscribe = onSnapshot(q, (snap) => {
-            const logs = snap.docs.map(d => ({ id: d.id, ...d.data() } as any)).filter((l:any) => !l.endTime);
-            setActiveLogs(logs);
-        });
-        return () => unsubscribe();
+
+        let unsubscribe: (() => void) | null = null;
+        let cancelled = false;
+
+        const load = async () => {
+            const logs = await pb.collection('serviceLogs').getFullList({
+                filter: `classroom = "${classroomId}" && date = "${today}"`,
+                ...authQuery,
+            });
+            if (!cancelled) setActiveLogs(logs.filter((l: any) => !l.endTime));
+        };
+        load().catch(e => console.error('Error loading active logs', e));
+
+        pb.collection('serviceLogs').subscribe('*', (e) => {
+            setActiveLogs(prev => {
+                if (e.record.date !== today) return prev;
+                if (e.action === 'delete') return prev.filter(l => l.id !== e.record.id);
+                const withoutRecord = prev.filter(l => l.id !== e.record.id);
+                return e.record.endTime ? withoutRecord : [...withoutRecord, e.record];
+            });
+        }, { filter: `classroom = "${classroomId}"`, ...authQuery }).then(unsub => { unsubscribe = unsub; });
+
+        return () => {
+            cancelled = true;
+            unsubscribe?.();
+        };
     }, [status, classroomId]);
 
     const loadReportLogs = async (date: string) => {
         if (!classroomId || !selectedStudent || !selectedPca) return;
-        const q = query(collection(db, 'serviceLogs'), 
-            where('classroomId', '==', classroomId), 
-            where('date', '==', date)
-        );
-        const snap = await getDocs(q);
-        const logs = snap.docs
-           .map(d => ({ id: d.id, ...d.data() } as any))
-           .filter(l => l.studentId === selectedStudent.id && l.pcaId === selectedPca.id && l.endTime);
-        setReportLogs(logs.sort((a,b) => b.startTime - a.startTime));
+        const logs = await pb.collection('serviceLogs').getFullList({
+            filter: `classroom = "${classroomId}" && date = "${date}" && student = "${selectedStudent.id}" && pca = "${selectedPca.id}"`,
+            ...authQuery,
+        });
+        setReportLogs(logs.filter((l: any) => l.endTime).sort((a: any, b: any) => b.startTime - a.startTime));
     };
 
     useEffect(() => {
         if (viewMode === 'reporting' && selectedStudent && selectedPca) {
-            loadReportLogs(reportDate);
+            loadReportLogs(reportDate).catch(e => console.error('Error loading report logs', e));
         }
     }, [viewMode, reportDate, selectedStudent, selectedPca]);
 
     const startService = async (service: string) => {
         if (!selectedPca || !selectedStudent || !classroomId) return;
-        
+
         // Ensure PCA only does one task at once across all students
-        if (activeLogs.some((l:any) => l.pcaId === selectedPca.id)) {
+        if (activeLogs.some((l: any) => l.pca === selectedPca.id)) {
             alert("Warning: You are already performing an active task for a student. Please stop your current task before starting a new one.");
             return;
         }
 
         try {
             const today = format(new Date(), 'yyyy-MM-dd');
-            const newRef = doc(collection(db, 'serviceLogs'));
-            const payload = {
-                classroomId,
-                studentId: selectedStudent.id,
-                pcaId: selectedPca.id,
+            const now = Date.now();
+            await pb.collection('serviceLogs').create({
+                classroom: classroomId,
+                student: selectedStudent.id,
+                pca: selectedPca.id,
                 serviceType: service,
-                startTime: Date.now(),
+                startTime: now,
                 date: today,
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            };
-            await setDoc(newRef, payload);
+                createdAt: now,
+                updatedAt: now,
+            }, authQuery as any);
         } catch (e: any) {
             console.error('Failed to start service: ', e);
         }
@@ -226,10 +205,10 @@ export function PcaMobileView() {
 
     const stopService = async (logId: string) => {
         try {
-            await updateDoc(doc(db, 'serviceLogs', logId), {
+            await pb.collection('serviceLogs').update(logId, {
                 endTime: Date.now(),
-                updatedAt: Date.now()
-            });
+                updatedAt: Date.now(),
+            }, authQuery as any);
         } catch (e: any) {
             console.error('Failed to stop service: ', e);
         }
@@ -248,21 +227,19 @@ export function PcaMobileView() {
                     </CardHeader>
                     <CardContent className="pt-6">
                         <p className="text-slate-700">{errorMsg}</p>
-                        {authWaitMsg && <p className="text-yellow-600 font-bold mt-4 animate-pulse">{authWaitMsg}</p>}
-                        {!authWaitMsg && <p className="text-sm text-slate-500 mt-4">Please ask the teacher to show you the QR code again.</p>}
                     </CardContent>
                 </Card>
             </div>
         );
     }
 
-    const uncompletedServices = SERVICES.filter(s => 
-        !activeLogs.some((l:any) => l.pcaId === selectedPca?.id && l.studentId === selectedStudent?.id && l.serviceType === s)
+    const uncompletedServices = SERVICES.filter(s =>
+        !activeLogs.some((l: any) => l.pca === selectedPca?.id && l.student === selectedStudent?.id && l.serviceType === s)
     );
-    const currentActiveForSelection = activeLogs.filter((l:any) => l.pcaId === selectedPca?.id && l.studentId === selectedStudent?.id);
+    const currentActiveForSelection = activeLogs.filter((l: any) => l.pca === selectedPca?.id && l.student === selectedStudent?.id);
 
-    const pcaActiveTask = selectedPca ? activeLogs.find((l:any) => l.pcaId === selectedPca.id) : null;
-    const pcaActiveTaskStudent = pcaActiveTask ? students.find((s:any) => s.id === pcaActiveTask.studentId) : null;
+    const pcaActiveTask = selectedPca ? activeLogs.find((l: any) => l.pca === selectedPca.id) : null;
+    const pcaActiveTaskStudent = pcaActiveTask ? students.find((s: any) => s.id === pcaActiveTask.student) : null;
 
     return (
         <div className="flex flex-col min-h-screen bg-slate-50 relative pb-16">
@@ -273,8 +250,8 @@ export function PcaMobileView() {
                         Offline Mode - Data will sync when reconnected
                     </div>
                 )}
-                {token === 'login-bypass' && (
-                    <button 
+                {isStaffMode && (
+                    <button
                         onClick={() => navigate('/pca-dashboard', { state: { explicit: true } })}
                         className={`absolute left-4 ${isOffline ? 'top-8' : 'top-4'} text-sm font-semibold text-blue-600 bg-blue-50 px-3 py-1 rounded-full`}
                     >
@@ -283,17 +260,16 @@ export function PcaMobileView() {
                 )}
                 <h1 className={`text-xl font-bold text-slate-800 ${isOffline ? 'mt-4' : ''}`}>{classroomName}</h1>
                 <p className="text-xs font-bold text-slate-400 tracking-wider">PCA LOGGING VIEW</p>
-                <div className={`absolute right-4 ${isOffline ? 'top-8' : 'top-4'}`}>
-                    <button 
-                        onClick={async () => {
-                            await auth.signOut();
-                            window.location.reload();
-                        }}
-                        className="text-sm font-semibold text-slate-500 hover:text-slate-800"
-                    >
-                        Sign Out
-                    </button>
-                </div>
+                {isStaffMode && (
+                    <div className={`absolute right-4 ${isOffline ? 'top-8' : 'top-4'}`}>
+                        <button
+                            onClick={() => { logout(); window.location.reload(); }}
+                            className="text-sm font-semibold text-slate-500 hover:text-slate-800"
+                        >
+                            Sign Out
+                        </button>
+                    </div>
+                )}
             </header>
 
             <main className="flex-grow p-4 max-w-lg mx-auto w-full">
@@ -318,7 +294,7 @@ export function PcaMobileView() {
                             <span className="text-slate-400">/</span>
                             <span className="font-bold text-slate-700">{selectedPca.name}</span>
                         </div>
-                        
+
                         <h2 className="text-lg font-bold text-slate-700 mb-4">Select Student</h2>
                         <div className="space-y-2 mb-6">
                             {students.map(s => (
@@ -364,20 +340,20 @@ export function PcaMobileView() {
                             <span className="text-slate-400">/</span>
                             <span className="font-bold text-slate-700">{selectedPca.name}</span>
                         </div>
-                        
+
                         <div className="bg-slate-800 text-white p-4 rounded-xl shadow-lg">
                             <p className="text-sm font-medium text-slate-400 mb-1">Services for</p>
                             <p className="text-2xl font-bold">{selectedStudent.name}</p>
                         </div>
 
                         <div className="flex bg-white rounded-lg p-1 border border-slate-200">
-                            <button 
+                            <button
                                 onClick={() => setViewMode('logging')}
                                 className={`flex-1 py-2 text-sm font-bold rounded-md transition-colors ${viewMode === 'logging' ? 'bg-blue-50 text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
                             >
                                 Log Data
                             </button>
-                            <button 
+                            <button
                                 onClick={() => setViewMode('reporting')}
                                 className={`flex-1 py-2 text-sm font-bold rounded-md transition-colors ${viewMode === 'reporting' ? 'bg-blue-50 text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
                             >
@@ -416,15 +392,15 @@ export function PcaMobileView() {
                                 <div>
                                     <h3 className="text-sm font-bold text-slate-500 uppercase mb-3 mt-6">Start New Service</h3>
                                     <div className="space-y-2">
-                                        {activeLogs.some((l:any) => l.pcaId === selectedPca.id) ? (
+                                        {activeLogs.some((l:any) => l.pca === selectedPca.id) ? (
                                             <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-xl">
                                                 <p className="text-yellow-800 text-sm font-semibold">You already have an active task running. Please stop it first.</p>
                                             </div>
                                         ) : (
                                             <>
                                                 {uncompletedServices.map(service => (
-                                                    <button 
-                                                        key={service} 
+                                                    <button
+                                                        key={service}
                                                         onClick={() => startService(service)}
                                                         className="w-full text-left bg-white p-4 rounded-xl border border-slate-200 shadow-sm active:bg-blue-50 hover:border-blue-400 transition-colors font-bold text-slate-700 flex justify-between items-center"
                                                     >
@@ -446,9 +422,9 @@ export function PcaMobileView() {
                             <div className="space-y-4 animate-in fade-in">
                                 <div className="space-y-2">
                                     <label className="text-xs font-bold text-slate-500 uppercase">Select Date</label>
-                                    <input 
-                                        type="date" 
-                                        className="w-full p-3 rounded-lg border border-slate-300" 
+                                    <input
+                                        type="date"
+                                        className="w-full p-3 rounded-lg border border-slate-300"
                                         value={reportDate}
                                         onChange={(e) => setReportDate(e.target.value)}
                                     />
